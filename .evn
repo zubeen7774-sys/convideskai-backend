@@ -3,4 +3,4 @@ WA_TOKEN=EAANOVgh5TssBRkjFIxUf9o18GedGjqqaRV5XdqZAllMowO0aQqwsXpzu5CNQpR48Myo7w5
 PHONE_NUMBER_ID=950602574813735
 SUPABASE_URL=https://zjjsucjbczqjrzfjgkip.supabase.co
 SUPABASE_KEY=sb_publishable_FWbwe9bpMFrozgmCSmg6Bg_pZqX3MNu
-PORT=3000
+PORT=8080

@@ -6,7 +6,6 @@ app.use(express.json());
 
 const VERIFY_TOKEN = "convidesk123";
 const WA_TOKEN = process.env.WA_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
@@ -24,44 +23,100 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
+  res.sendStatus(200); // Meta ko turant 200 do
+  
   const body = req.body;
-  if (body.object === 'whatsapp_business_account') {
-    const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (message && message.type === 'text') {
-      const from = message.from;
-      const text = message.text.body.toLowerCase().trim();
-      const reply = await getReply(from, text);
-      await sendMessage(from, reply);
-    }
-  }
-  res.sendStatus(200);
+  if (body.object !== 'whatsapp_business_account') return;
+
+  const entry = body.entry?.[0]?.changes?.[0]?.value;
+  const message = entry?.messages?.[0];
+  if (!message || message.type !== 'text') return;
+
+  const from = message.from;
+  const text = message.text.body.toLowerCase().trim();
+  const phoneNumberId = entry?.metadata?.phone_number_id;
+  const messageId = message.id;
+
+  // Duplicate check
+  const { data: existing } = await supabase
+    .from('processed_messages')
+    .select('id')
+    .eq('message_id', messageId)
+    .maybeSingle();
+
+  if (existing) return;
+
+  await supabase
+    .from('processed_messages')
+    .insert({ message_id: messageId });
+
+  const reply = await getReply(from, text, phoneNumberId);
+  await sendMessage(from, reply, phoneNumberId);
 });
 
-async function getReply(from, text) {
+async function getReply(from, text, phoneNumberId) {
   try {
-    const { data: firstBusiness } = await supabase
-      .from('businesses')
-      .select('user_id')
-      .limit(1)
-      .single();
+    // Step 1: phone_number_id se client dhundo
+    let userId = null;
 
-    const userId = firstBusiness?.user_id;
-
-    if (!userId) {
-      return "Shukriya! Hum jald reply karenge.";
+    if (phoneNumberId) {
+      const { data: waAccount } = await supabase
+        .from('whatsapp_accounts')
+        .select('user_id')
+        .eq('phone_number_id', phoneNumberId)
+        .maybeSingle();
+      userId = waAccount?.user_id;
     }
 
-    // Price query
-    if (text.includes('price') || text.includes('rate') ||
-        text.includes('kitna') || text.includes('cost') ||
-        text.includes('kya hai') || text.includes('btao')) {
+    // Fallback: pehla business
+    if (!userId) {
+      const { data: firstBusiness } = await supabase
+        .from('businesses')
+        .select('user_id')
+        .limit(1)
+        .maybeSingle();
+      userId = firstBusiness?.user_id;
+    }
 
+    if (!userId) return "Shukriya! Hum jald reply karenge.";
+
+    // Step 2: Knowledge Base
+    const { data: knowledge } = await supabase
+      .from('knowledge_base')
+      .select('title, content')
+      .eq('user_id', userId);
+
+    if (knowledge?.length > 0) {
+      for (const item of knowledge) {
+        if (item.title && text.includes(item.title.toLowerCase())) {
+          return item.content;
+        }
+      }
+    }
+
+    // Step 3: Auto Reply Rules
+    const { data: rules } = await supabase
+      .from('auto_reply_rules')
+      .select('keyword, reply')
+      .eq('user_id', userId);
+
+    if (rules?.length > 0) {
+      for (const rule of rules) {
+        const keyword = rule.keyword?.toLowerCase();
+        if (keyword && text.includes(keyword)) {
+          return rule.reply;
+        }
+      }
+    }
+
+    // Step 4: Products
+    if (/price|rate|kitna|cost|kya hai|btao|product|list/.test(text)) {
       const { data: products } = await supabase
         .from('products')
         .select('name, price, stock')
         .eq('user_id', userId);
 
-      if (products && products.length > 0) {
+      if (products?.length > 0) {
         let reply = "Hamare products ki price list:\n\n";
         products.forEach(p => {
           reply += `• ${p.name}: ₹${p.price}\n`;
@@ -70,16 +125,13 @@ async function getReply(from, text) {
       }
     }
 
-    // Stock query
-    if (text.includes('stock') || text.includes('available') ||
-        text.includes('hai kya') || text.includes('milega')) {
-
+    if (/stock|available|hai kya|milega/.test(text)) {
       const { data: products } = await supabase
         .from('products')
         .select('name, stock')
         .eq('user_id', userId);
 
-      if (products && products.length > 0) {
+      if (products?.length > 0) {
         let reply = "Stock availability:\n\n";
         products.forEach(p => {
           const status = p.stock > 0 ? `${p.stock} units available` : "Out of stock";
@@ -89,33 +141,19 @@ async function getReply(from, text) {
       }
     }
 
-    // Auto reply rules
-    const { data: rules } = await supabase
-      .from('auto_reply_rules')
-      .select('*')
-      .eq('user_id', userId);
-
-    if (rules && rules.length > 0) {
-      for (const rule of rules) {
-        const keyword = rule.keyword?.toLowerCase();
-        if (keyword && text.includes(keyword)) {
-          return rule.reply;
-        }
-      }
-    }
-
     return "Shukriya message karne ke liye! Koi aur sawaal ho toh batayein.";
 
   } catch (err) {
-    console.error('Error:', err);
+    console.error('getReply error:', err);
     return "Shukriya! Hum jald reply karenge.";
   }
 }
 
-async function sendMessage(to, message) {
+async function sendMessage(to, message, phoneNumberId) {
+  const pid = phoneNumberId || process.env.PHONE_NUMBER_ID;
   try {
     await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v21.0/${pid}/messages`,
       {
         messaging_product: 'whatsapp',
         to: to,
@@ -129,11 +167,9 @@ async function sendMessage(to, message) {
       }
     );
   } catch (err) {
-    console.error('WhatsApp send error:', err);
+    console.error('WhatsApp error:', err.response?.data || err.message);
   }
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

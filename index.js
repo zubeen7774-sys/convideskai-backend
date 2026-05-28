@@ -280,26 +280,40 @@ async function getReply(userId, customerPhone, text) {
 // ─── SEND WHATSAPP MESSAGE ────────────────────────────────────────────────────
 
 async function sendWhatsAppMessage(to, message) {
+  if (!WA_TOKEN) {
+    log("WA_SEND_ERR", "WA_TOKEN missing in environment variables!");
+    return;
+  }
+  if (!PHONE_NUMBER_ID) {
+    log("WA_SEND_ERR", "PHONE_NUMBER_ID missing in environment variables!");
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "text",
+    text: { body: message, preview_url: false }
+  };
+
+  log("WA_SEND", `Attempting to send to ${to}`);
+
   try {
-    await axios.post(
-      `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        to: to,
-        type: 'text',
-        text: { body: message, preview_url: false }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${WA_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
+    const response = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json"
       }
-    );
-    log('WA_SEND', `Sent to ${to}`);
+    });
+    log("WA_SEND", `Success to ${to} | ID: ${response.data?.messages?.[0]?.id}`);
   } catch (err) {
-    const errMsg = err.response?.data?.error?.message || err.message;
-    log('WA_SEND_ERR', `Failed to send to ${to}`, errMsg);
+    const meta = err.response?.data?.error;
+    log("WA_SEND_ERR", `Failed to ${to} | Code: ${meta?.code} | ${meta?.message || err.message}`);
+    if (meta?.code === 190)    log("WA_SEND_ERR", "FIX: WA_TOKEN expired - get new token from Meta Developer Console");
+    if (meta?.code === 100)    log("WA_SEND_ERR", "FIX: PHONE_NUMBER_ID is wrong or number not connected to WhatsApp Business");
+    if (meta?.code === 131030) log("WA_SEND_ERR", "FIX: Customer did not message in last 24 hours - use template message");
+    if (meta?.code === 131047) log("WA_SEND_ERR", "FIX: 24-hour window expired - customer must message first");
   }
 }
 

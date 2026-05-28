@@ -1,115 +1,139 @@
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-
 const app = express();
 app.use(express.json());
 
-// ─── ENV ──────────────────────────────────────────────────────────────────────
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN    || 'convideskai123';
-const WA_TOKEN        = process.env.WA_TOKEN;
+const VERIFY_TOKEN = "convidesk123";
+const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const SUPABASE_URL    = process.env.SUPABASE_URL;
-const SUPABASE_KEY    = process.env.SUPABASE_KEY;
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function log(tag, msg, data = '') {
-  console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`, data);
-}
-
-async function resolveUserId(phoneId) {
-  const { data } = await supabase.from('businesses').select('user_id').eq('phone_number_id', phoneId).maybeSingle();
-  if (!data) {
-    const { data: first } = await supabase.from('businesses').select('user_id').limit(1).maybeSingle();
-    return first?.user_id || null;
-  }
-  return data.user_id;
-}
-
-// ─── CORE LOGIC FUNCTIONS ────────────────────────────────────────────────────
-async function upsertConversation(userId, customerPhone, customerName, lastMessage, status) {
-  const { data: existing } = await supabase.from('conversations').select('id, unread_count').eq('user_id', userId).eq('customer_phone', customerPhone).maybeSingle();
-  if (existing) {
-    await supabase.from('conversations').update({ last_message: lastMessage, status: status, unread_count: (existing.unread_count || 0) + 1, updated_at: new Date().toISOString() }).eq('id', existing.id);
-    return existing.id;
-  } else {
-    const { data: newConv } = await supabase.from('conversations').insert({ user_id: userId, customer_phone: customerPhone, customer_name: customerName || customerPhone, last_message: lastMessage, status: status, unread_count: 1, updated_at: new Date().toISOString() }).select('id').single();
-    return newConv?.id || null;
-  }
-}
-
-async function saveMessage(userId, conversationId, customerPhone, text, sender) {
-  await supabase.from('messages').insert({ user_id: userId, conversation_id: conversationId, customer_phone: customerPhone, body: text, sender: sender, created_at: new Date().toISOString() });
-}
-
-function needsHumanTakeover(text) {
-  const triggers = ['complaint', 'refund', 'return', 'damaged', 'agent', 'manager', 'help me', 'urgent'];
-  return triggers.some(k => text.toLowerCase().includes(k));
-}
-
-async function getReply(userId, customerPhone, text) {
-  // Yahan aap apna AI response logic call kar sakte hain
-  return { reply: 'Shukriya! Humne aapki query note kar li hai.', tag: 'AI Replied', status: 'ai' };
-}
-
-async function sendWhatsAppMessage(to, message) {
-  try {
-    await axios.post(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`, {
-      messaging_product: "whatsapp", to, type: "text", text: { body: message }
-    }, { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" } });
-  } catch (err) { log("WA_SEND_ERR", err.message); }
-}
-
-// ─── WEBHOOK ENDPOINTS ───────────────────────────────────────────────────────
 app.get('/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
-    res.status(200).send(req.query['hub.challenge']);
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Meta ko turant response do
-  
-  const entry = req.body.entry?.[0];
-  const value = entry?.changes?.[0]?.value;
-  const message = value?.messages?.[0];
-  
-  if (!message) return;
-
-  const customerPhone = message.from;
-  const text = message.text?.body || "";
-  const customerName = value?.contacts?.[0]?.profile?.name || customerPhone;
-
-  log('INCOMING', `From: ${customerPhone} | Text: ${text}`);
-
-  const userId = await resolveUserId(PHONE_NUMBER_ID);
-  if (!userId) return log('ERROR', 'User not found in DB');
-
-  // Human Takeover
-  if (needsHumanTakeover(text)) {
-    const convId = await upsertConversation(userId, customerPhone, customerName, text, 'human');
-    await saveMessage(userId, convId, customerPhone, text, 'customer');
-    await sendWhatsAppMessage(customerPhone, '🙏 Aapki request note kar li gayi hai. Agent jald sampark karenge.');
-    return;
+  const body = req.body;
+  if (body.object === 'whatsapp_business_account') {
+    const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (message && message.type === 'text') {
+      const from = message.from;
+      const text = message.text.body.toLowerCase().trim();
+      const reply = await getReply(from, text);
+      await sendMessage(from, reply);
+    }
   }
-
-  // AI Reply Workflow
-  const { reply, tag, status } = await getReply(userId, customerPhone, text);
-  const convId = await upsertConversation(userId, customerPhone, customerName, text, status);
-  
-  await saveMessage(userId, convId, customerPhone, text, 'customer');
-  await saveMessage(userId, convId, customerPhone, reply, 'bot');
-  await sendWhatsAppMessage(customerPhone, reply);
-  
-  log('DONE', `Replied to ${customerPhone}`);
+  res.sendStatus(200);
 });
 
-// ─── SERVER START ────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => {
-  log('SERVER', `ConviDeskAI backend running on port ${PORT}`);
+async function getReply(from, text) {
+  try {
+    const { data: firstBusiness } = await supabase
+      .from('businesses')
+      .select('user_id')
+      .limit(1)
+      .single();
+
+    const userId = firstBusiness?.user_id;
+
+    if (!userId) {
+      return "Shukriya! Hum jald reply karenge.";
+    }
+
+    // Price query
+    if (text.includes('price') || text.includes('rate') ||
+        text.includes('kitna') || text.includes('cost') ||
+        text.includes('kya hai') || text.includes('btao')) {
+
+      const { data: products } = await supabase
+        .from('products')
+        .select('name, price, stock')
+        .eq('user_id', userId);
+
+      if (products && products.length > 0) {
+        let reply = "Hamare products ki price list:\n\n";
+        products.forEach(p => {
+          reply += `• ${p.name}: ₹${p.price}\n`;
+        });
+        return reply;
+      }
+    }
+
+    // Stock query
+    if (text.includes('stock') || text.includes('available') ||
+        text.includes('hai kya') || text.includes('milega')) {
+
+      const { data: products } = await supabase
+        .from('products')
+        .select('name, stock')
+        .eq('user_id', userId);
+
+      if (products && products.length > 0) {
+        let reply = "Stock availability:\n\n";
+        products.forEach(p => {
+          const status = p.stock > 0 ? `${p.stock} units available` : "Out of stock";
+          reply += `• ${p.name}: ${status}\n`;
+        });
+        return reply;
+      }
+    }
+
+    // Auto reply rules
+    const { data: rules } = await supabase
+      .from('auto_reply_rules')
+      .select('*')
+      .eq('user_id', userId);
+
+    if (rules && rules.length > 0) {
+      for (const rule of rules) {
+        const keyword = rule.keyword?.toLowerCase();
+        if (keyword && text.includes(keyword)) {
+          return rule.reply;
+        }
+      }
+    }
+
+    return "Shukriya message karne ke liye! Koi aur sawaal ho toh batayein.";
+
+  } catch (err) {
+    console.error('Error:', err);
+    return "Shukriya! Hum jald reply karenge.";
+  }
+}
+
+async function sendMessage(to, message) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        text: { body: message }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WA_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+  } catch (err) {
+    console.error('WhatsApp send error:', err);
+  }
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

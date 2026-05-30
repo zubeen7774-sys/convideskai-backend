@@ -1,5 +1,3 @@
-require('dotenv').config();
-
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
@@ -7,333 +5,495 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
 
-// ── Config ──
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "convidesk123";
-const WA_TOKEN = process.env.WA_TOKEN;
-const SYSTEM_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const GRAPH_API_VERSION = "v21.0";
-const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
+// ─── ENV ──────────────────────────────────────────────────────────────────────
+const VERIFY_TOKEN   = process.env.VERIFY_TOKEN   || 'convidesk123';
+const WA_TOKEN       = process.env.WA_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SUPABASE_KEY   = process.env.SUPABASE_KEY;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── In-memory dedup cache ──
-const processedMessages = new Set();
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-// ── Logging helper ──
-function log(level, msg, data = {}) {
-  const timestamp = new Date().toISOString();
-  console[level === 'error' ? 'error' : 'log'](
-    JSON.stringify({ timestamp, level, msg, ...data })
-  );
+function log(tag, msg, data = '') {
+  console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`, data);
 }
 
-// ── Health check ──
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'ConviDesk WhatsApp Bot',
-    version: '2.0.0',
-    timestamp: new Date().toISOString()
-  });
-});
+// Phone number ko user_id mein resolve karta hai (businesses table se)
+async function resolveUserId(phone) {
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('user_id')
+    .eq('whatsapp_number', phone)
+    .maybeSingle();
 
-// ── Webhook verification ──
+  if (error) log('RESOLVE', 'businesses lookup error', error.message);
+
+  // Agar specific business nahi mila to pehla business lo
+  if (!data) {
+    const { data: first } = await supabase
+      .from('businesses')
+      .select('user_id')
+      .limit(1)
+      .maybeSingle();
+    return first?.user_id || null;
+  }
+  return data.user_id;
+}
+
+// ─── SUPABASE: CONVERSATION UPSERT ───────────────────────────────────────────
+
+async function upsertConversation(userId, customerPhone, customerName, lastMessage, status) {
+  const { data: existing } = await supabase
+    .from('conversations')
+    .select('id, unread_count')
+    .eq('user_id', userId)
+    .eq('customer_phone', customerPhone)
+    .maybeSingle();
+
+  if (existing) {
+    await supabase
+      .from('conversations')
+      .update({
+        last_message: lastMessage,
+        status: status,
+        unread_count: (existing.unread_count || 0) + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', existing.id);
+    return existing.id;
+  } else {
+    const { data: newConv } = await supabase
+      .from('conversations')
+      .insert({
+        user_id: userId,
+        customer_phone: customerPhone,
+        customer_name: customerName || customerPhone,
+        last_message: lastMessage,
+        status: status,
+        unread_count: 1,
+        updated_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+    return newConv?.id || null;
+  }
+}
+
+// ─── SUPABASE: MESSAGE SAVE ───────────────────────────────────────────────────
+
+async function saveMessage(userId, conversationId, customerPhone, text, sender) {
+  const { error } = await supabase
+    .from('messages')
+    .insert({
+      user_id: userId,
+      conversation_id: conversationId,
+      customer_phone: customerPhone,
+      body: text,
+      sender: sender, // 'customer' | 'bot' | 'agent'
+      created_at: new Date().toISOString(),
+    });
+
+  if (error) log('MSG_SAVE', 'Error saving message', error.message);
+}
+
+// ─── SUPABASE: LEAD CAPTURE ───────────────────────────────────────────────────
+
+async function captureLead(userId, customerPhone, customerName, inquiryType, score, estimatedValue) {
+  // Already exists to check karo
+  const { data: existing } = await supabase
+    .from('leads')
+    .select('id, lead_score')
+    .eq('user_id', userId)
+    .eq('customer_phone', customerPhone)
+    .maybeSingle();
+
+  if (existing) {
+    // Score update karo agar zyada hai
+    if (score > (existing.lead_score || 0)) {
+      await supabase
+        .from('leads')
+        .update({ lead_score: score, inquiry_type: inquiryType, updated_at: new Date().toISOString() })
+        .eq('id', existing.id);
+    }
+  } else {
+    await supabase
+      .from('leads')
+      .insert({
+        user_id: userId,
+        customer_phone: customerPhone,
+        customer_name: customerName || customerPhone,
+        inquiry_type: inquiryType,
+        lead_score: score,
+        estimated_value: estimatedValue || null,
+        created_at: new Date().toISOString(),
+      });
+    log('LEAD', `New lead captured: ${customerPhone} | ${inquiryType} | Score: ${score}`);
+  }
+}
+
+// ─── LEAD SCORING ─────────────────────────────────────────────────────────────
+
+function calculateLeadScore(text) {
+  let score = 0;
+  const t = text.toLowerCase();
+
+  // High intent keywords
+  const highIntent = ['bulk', 'wholesale', 'order', 'buy', 'purchase', 'distributor',
+    'dealer', 'franchise', 'contract', 'supply', 'import', 'export'];
+  const medIntent  = ['price', 'rate', 'cost', 'kitna', 'how much', 'kya rate',
+    'minimum', 'quantity', 'delivery', 'dispatch'];
+  const lowIntent  = ['interested', 'info', 'details', 'catalogue', 'catalog', 'list'];
+
+  highIntent.forEach(k => { if (t.includes(k)) score += 25; });
+  medIntent.forEach(k  => { if (t.includes(k)) score += 15; });
+  lowIntent.forEach(k  => { if (t.includes(k)) score += 8; });
+
+  return Math.min(score, 99);
+}
+
+function detectLeadType(text) {
+  const t = text.toLowerCase();
+  if (t.includes('bulk') || t.includes('wholesale')) return 'Bulk Order Inquiry';
+  if (t.includes('distributor') || t.includes('dealer'))  return 'Distributorship Interest';
+  if (t.includes('price') || t.includes('rate') || t.includes('kitna')) return 'Pricing Inquiry';
+  if (t.includes('delivery') || t.includes('dispatch'))   return 'Delivery Inquiry';
+  if (t.includes('order'))  return 'Order Inquiry';
+  if (t.includes('stock') || t.includes('available'))     return 'Stock Inquiry';
+  return 'General Inquiry';
+}
+
+// ─── HUMAN TAKEOVER CHECK ─────────────────────────────────────────────────────
+
+function needsHumanTakeover(text) {
+  const triggers = [
+    'complaint', 'refund', 'return', 'damaged', 'wrong item',
+    'speak to human', 'agent', 'manager', 'help me', 'urgent',
+    'problem', 'issue', 'not working', 'fraud', 'cheated'
+  ];
+  const t = text.toLowerCase();
+  return triggers.some(k => t.includes(k));
+}
+
+// ─── CORE REPLY LOGIC ─────────────────────────────────────────────────────────
+
+async function getReply(userId, customerPhone, text) {
+  const t = text.toLowerCase().trim();
+
+  // 1. Knowledge Base check (FAQ)
+  const { data: kbItems } = await supabase
+    .from('knowledge_base')
+    .select('title, content, keywords')
+    .eq('user_id', userId);
+
+  if (kbItems && kbItems.length > 0) {
+    for (const kb of kbItems) {
+      const keywords = kb.keywords
+        ? kb.keywords.split(',').map(k => k.trim().toLowerCase())
+        : [kb.title.toLowerCase()];
+
+      const matched = keywords.some(k => t.includes(k));
+      if (matched && kb.content) {
+        log('KB', `Matched KB item: ${kb.title}`);
+        return { reply: kb.content, tag: 'AI Replied', status: 'ai' };
+      }
+    }
+  }
+
+  // 2. Price query
+  if (t.includes('price') || t.includes('rate') || t.includes('kitna') ||
+      t.includes('cost') || t.includes('kya hai') || t.includes('btao') ||
+      t.includes('how much') || t.includes('kya rate')) {
+
+    const { data: products } = await supabase
+      .from('products')
+      .select('name, price, stock')
+      .eq('user_id', userId);
+
+    if (products && products.length > 0) {
+      let reply = '📦 *Hamare Products ki Price List:*\n\n';
+      products.forEach(p => {
+        reply += `• *${p.name}* — ₹${p.price?.toLocaleString('en-IN')}\n`;
+      });
+      reply += '\n📞 Bulk order ya special rate ke liye directly contact karein!';
+      return { reply, tag: 'Lead Captured', status: 'ai' };
+    }
+  }
+
+  // 3. Stock query
+  if (t.includes('stock') || t.includes('available') ||
+      t.includes('hai kya') || t.includes('milega') || t.includes('in stock')) {
+
+    const { data: products } = await supabase
+      .from('products')
+      .select('name, stock')
+      .eq('user_id', userId);
+
+    if (products && products.length > 0) {
+      let reply = '✅ *Stock Availability:*\n\n';
+      products.forEach(p => {
+        const status = (p.stock > 0)
+          ? `✅ ${p.stock} units available`
+          : '❌ Out of stock';
+        reply += `• *${p.name}*: ${status}\n`;
+      });
+      return { reply, tag: 'AI Replied', status: 'ai' };
+    }
+  }
+
+  // 4. Auto reply rules (keyword-based)
+  const { data: rules } = await supabase
+    .from('auto_reply_rules')
+    .select('keyword, reply, is_active')
+    .eq('user_id', userId)
+    .eq('is_active', true);
+
+  if (rules && rules.length > 0) {
+    for (const rule of rules) {
+      const keyword = rule.keyword?.toLowerCase();
+      if (keyword && t.includes(keyword)) {
+        log('RULE', `Matched rule keyword: ${keyword}`);
+        return { reply: rule.reply, tag: 'AI Replied', status: 'ai' };
+      }
+    }
+  }
+
+  // 5. Greeting
+  if (t === 'hi' || t === 'hello' || t === 'hlo' || t === 'hey' ||
+      t === 'hii' || t === 'assalam' || t.includes('namaste') || t.includes('namaskar')) {
+    return {
+      reply: '👋 *Aadab!* ConviDesk mein aapka swagat hai!\n\nHum aapki kaise madad kar sakte hain?\n\n• 📦 *Product price* jaanne ke liye "price" likhen\n• 📋 *Stock* check karne ke liye "stock" likhen\n• 📞 *Agent se baat* karne ke liye "agent" likhen',
+      tag: 'AI Replied',
+      status: 'ai'
+    };
+  }
+
+  // 6. Default fallback
+  return {
+    reply: 'Shukriya message karne ke liye! 🙏\nAapki query note kar li gayi hai. Hamare agent jald aapse sampark karenge.\n\n_ConviDesk AI_',
+    tag: 'AI Replied',
+    status: 'ai'
+  };
+}
+
+// ─── SEND WHATSAPP MESSAGE ────────────────────────────────────────────────────
+
+async function sendWhatsAppMessage(to, message) {
+  if (!WA_TOKEN) {
+    log("WA_SEND_ERR", "WA_TOKEN missing in environment variables!");
+    return;
+  }
+  if (!PHONE_NUMBER_ID) {
+    log("WA_SEND_ERR", "PHONE_NUMBER_ID missing in environment variables!");
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "text",
+    text: { body: message, preview_url: false }
+  };
+
+  log("WA_SEND", `Attempting to send to ${to}`);
+
+  try {
+    const response = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    });
+    log("WA_SEND", `Success to ${to} | ID: ${response.data?.messages?.[0]?.id}`);
+  } catch (err) {
+    const meta = err.response?.data?.error;
+    log("WA_SEND_ERR", `Failed to ${to} | Code: ${meta?.code} | ${meta?.message || err.message}`);
+    if (meta?.code === 190)    log("WA_SEND_ERR", "FIX: WA_TOKEN expired - get new token from Meta Developer Console");
+    if (meta?.code === 100)    log("WA_SEND_ERR", "FIX: PHONE_NUMBER_ID is wrong or number not connected to WhatsApp Business");
+    if (meta?.code === 131030) log("WA_SEND_ERR", "FIX: Customer did not message in last 24 hours - use template message");
+    if (meta?.code === 131047) log("WA_SEND_ERR", "FIX: 24-hour window expired - customer must message first");
+  }
+}
+
+// ─── WEBHOOK VERIFY ───────────────────────────────────────────────────────────
+
 app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    log('info', 'Webhook verified successfully');
-    return res.status(200).send(challenge);
+    log('WEBHOOK', 'Verified successfully');
+    res.status(200).send(challenge);
+  } else {
+    log('WEBHOOK', 'Verification failed');
+    res.sendStatus(403);
   }
-
-  log('warn', 'Webhook verification failed', { mode, token });
-  res.sendStatus(403);
 });
 
-// ── Webhook message handler ──
+// ─── WEBHOOK RECEIVE ─────────────────────────────────────────────────────────
+
 app.post('/webhook', async (req, res) => {
+  // Meta ko turant 200 do — warna retry karega
   res.sendStatus(200);
 
   try {
     const body = req.body;
     if (body.object !== 'whatsapp_business_account') return;
 
-    const entry = body.entry?.[0]?.changes?.[0]?.value;
-    if (!entry) return;
+    const entry   = body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value   = changes?.value;
 
-    const message = entry.messages?.[0];
+    // ── Status update (delivered/read) — ignore ──
+    if (value?.statuses) return;
+
+    const message = value?.messages?.[0];
     if (!message) return;
 
-    if (message.type !== 'text') return;
+    const customerPhone = message.from;
+    const msgType       = message.type;
 
-    const messageId = message.id;
-    const from = message.from;
-    const text = message.text.body.trim();
-    const phoneNumberId = entry.metadata?.phone_number_id;
+    // Customer ka naam (contacts array se)
+    const customerName = value?.contacts?.[0]?.profile?.name || customerPhone;
 
-    if (processedMessages.has(messageId)) {
-      log('info', 'Duplicate message skipped', { messageId });
+    log('INCOMING', `From: ${customerPhone} | Name: ${customerName} | Type: ${msgType}`);
+
+    // Sirf text messages handle karo abhi
+    if (msgType !== 'text') {
+      await sendWhatsAppMessage(
+        customerPhone,
+        'Filhaal hum sirf text messages handle kar sakte hain. Please apna sawaal text mein bhejein. 🙏'
+      );
       return;
     }
-    processedMessages.add(messageId);
-    setTimeout(() => processedMessages.delete(messageId), 10 * 60 * 1000);
 
-    log('info', 'Message received', { from, phoneNumberId, text: text.slice(0, 50) });
+    const text = message.text?.body || '';
+    if (!text.trim()) return;
 
-    const reply = await getReply(from, text.toLowerCase(), phoneNumberId);
-    await sendMessage(from, reply, phoneNumberId);
-    await logIncomingMessage(from, text, phoneNumberId).catch(() => {});
+    // ── User resolve karo ──
+    const userId = await resolveUserId(PHONE_NUMBER_ID);
+    if (!userId) {
+      log('WARN', 'No userId found — check businesses table');
+      return;
+    }
+
+    // ── Human takeover check ──
+    if (needsHumanTakeover(text)) {
+      log('TAKEOVER', `Human escalation triggered for ${customerPhone}`);
+
+      const convId = await upsertConversation(
+        userId, customerPhone, customerName, text, 'human'
+      );
+      await saveMessage(userId, convId, customerPhone, text, 'customer');
+
+      await sendWhatsAppMessage(
+        customerPhone,
+        '🙏 Aapki request humne note kar li hai. Hamare agent jald aapse sampark karenge.\n\nThodi der sabr rakhein — ConviDesk Team'
+      );
+
+      // Conversation status human mein update
+      await supabase
+        .from('conversations')
+        .update({ status: 'human', tag: 'Human Takeover' })
+        .eq('user_id', userId)
+        .eq('customer_phone', customerPhone);
+
+      return;
+    }
+
+    // ── Lead scoring ──
+    const leadScore = calculateLeadScore(text);
+    const leadType  = detectLeadType(text);
+
+    if (leadScore >= 25) {
+      await captureLead(userId, customerPhone, customerName, leadType, leadScore, null);
+    }
+
+    // ── AI Reply generate karo ──
+    const { reply, tag, status } = await getReply(userId, customerPhone, text);
+
+    // ── Conversation upsert ──
+    const convId = await upsertConversation(
+      userId, customerPhone, customerName, text, status
+    );
+
+    // Tag update karo
+    if (convId) {
+      await supabase
+        .from('conversations')
+        .update({ tag: tag })
+        .eq('id', convId);
+    }
+
+    // ── Messages save karo ──
+    await saveMessage(userId, convId, customerPhone, text, 'customer');
+    await saveMessage(userId, convId, customerPhone, reply, 'bot');
+
+    // ── WhatsApp pe reply bhejo ──
+    await sendWhatsAppMessage(customerPhone, reply);
+
+    log('DONE', `Replied to ${customerPhone} | Tag: ${tag} | Lead Score: ${leadScore}`);
 
   } catch (err) {
-    log('error', 'Webhook processing error', { error: err.message });
+    log('ERROR', 'Webhook processing error', err.message);
   }
 });
 
-// ── Get user from phone_number_id ──
-async function getUserId(phoneNumberId) {
-  if (phoneNumberId) {
-    const { data } = await supabase
-      .from('whatsapp_accounts')
-      .select('user_id')
-      .eq('phone_number_id', phoneNumberId)
-      .maybeSingle();
+// ─── BROADCAST ENDPOINT ───────────────────────────────────────────────────────
+// POST /broadcast
+// Body: { user_id, message, phones: ["919876543210", ...] }
 
-    if (data?.user_id) return data.user_id;
+app.post('/broadcast', async (req, res) => {
+  const { user_id, message, phones } = req.body;
+
+  if (!user_id || !message || !Array.isArray(phones) || phones.length === 0) {
+    return res.status(400).json({ error: 'user_id, message, and phones[] required' });
   }
 
-  const { data } = await supabase
-    .from('businesses')
-    .select('user_id')
-    .limit(1)
-    .maybeSingle();
+  log('BROADCAST', `Sending to ${phones.length} contacts`);
 
-  return data?.user_id || null;
-}
+  const results = { sent: 0, failed: 0 };
 
-// ── Main reply logic ──
-async function getReply(from, text, phoneNumberId) {
-  try {
-    const userId = await getUserId(phoneNumberId);
-
-    if (!userId) {
-      log('warn', 'No user found for phone_number_id', { phoneNumberId });
-      return "Shukriya! Hum jald reply karenge.";
+  for (const phone of phones) {
+    try {
+      await sendWhatsAppMessage(phone, message);
+      results.sent++;
+      // Rate limit — 1 message per 100ms
+      await new Promise(r => setTimeout(r, 100));
+    } catch {
+      results.failed++;
     }
-
-    // Step 1: Knowledge Base
-    const { data: knowledge } = await supabase
-      .from('knowledge_base')
-      .select('title, content, keywords')
-      .eq('user_id', userId)
-      .eq('is_active', true);
-
-    if (knowledge?.length > 0) {
-      for (const item of knowledge) {
-        const titleMatch = item.title && text.includes(item.title.toLowerCase());
-        const keywordMatch = item.keywords && item.keywords.split(',').some(k => text.includes(k.trim().toLowerCase()));
-        if (titleMatch || keywordMatch) {
-          log('info', 'Knowledge base match', { title: item.title });
-          return item.content;
-        }
-      }
-    }
-
-    // Step 2: Auto Reply Rules
-    const { data: rules } = await supabase
-      .from('auto_reply_rules')
-      .select('keyword, reply')
-      .eq('user_id', userId)
-      .eq('is_active', true);
-
-    if (rules?.length > 0) {
-      for (const rule of rules) {
-        const keyword = rule.keyword?.toLowerCase();
-        if (keyword && text.includes(keyword)) {
-          log('info', 'Auto reply rule matched', { keyword });
-          return rule.reply;
-        }
-      }
-    }
-
-    // Step 3: Product Queries
-    const isPriceQuery = /price|rate|kitna|cost|kya hai|btao|product|list|catalogue|catalog/.test(text);
-    const isStockQuery = /stock|available|hai kya|milega|inventory/.test(text);
-
-    if (isPriceQuery || isStockQuery) {
-      const { data: products } = await supabase
-        .from('products')
-        .select('name, price, stock, category')
-        .eq('user_id', userId);
-
-      if (products?.length > 0) {
-        if (isPriceQuery) {
-          const specificProduct = products.find(p =>
-            text.includes(p.name.toLowerCase())
-          );
-
-          if (specificProduct) {
-            return `*${specificProduct.name}*\n💰 Price: ₹${specificProduct.price}\n📦 Stock: ${specificProduct.stock > 0 ? specificProduct.stock + ' units available' : 'Out of stock'}`;
-          }
-
-          const byCategory = products.reduce((acc, p) => {
-            const cat = p.category || 'Products';
-            if (!acc[cat]) acc[cat] = [];
-            acc[cat].push(p);
-            return acc;
-          }, {});
-
-          let reply = "📋 *Hamare Products Ki Price List:*\n\n";
-          for (const [cat, items] of Object.entries(byCategory)) {
-            if (Object.keys(byCategory).length > 1) {
-              reply += `*${cat}*\n`;
-            }
-            items.forEach(p => {
-              reply += `• ${p.name}: ₹${p.price}\n`;
-            });
-            reply += '\n';
-          }
-          reply += "_Koi specific product ke baare mein jaanna hai? Naam batao!_";
-          return reply.trim();
-        }
-
-        if (isStockQuery) {
-          let reply = "📦 *Stock Availability:*\n\n";
-          products.forEach(p => {
-            const status = p.stock > 0
-              ? `✅ ${p.stock} units available`
-              : "❌ Out of stock";
-            reply += `• ${p.name}: ${status}\n`;
-          });
-          return reply.trim();
-        }
-      }
-    }
-
-    // Step 4: Common queries
-    const greetings = /^(hi|hello|hey|helo|hii|namaste|namaskar|salaam|salam|assalam)/.test(text);
-    if (greetings) {
-      return "Namaste! 👋 Hamare store mein aapka swagat hai!\n\nMain aapki kya madad kar sakta hoon?\n• Price list ke liye likhein: *price*\n• Stock check ke liye: *stock*\n• Order ke liye: *order*";
-    }
-
-    const orderQuery = /order|book|kharidna|lena|chahiye/.test(text);
-    if (orderQuery) {
-      return "Order karne ke liye kripya batayein:\n\n1️⃣ Product ka naam\n2️⃣ Quantity\n3️⃣ Delivery address\n\nHum jald confirm karenge! ✅";
-    }
-
-    const locationQuery = /address|location|kahan|where|shop|store|office/.test(text);
-    if (locationQuery) {
-      const { data: business } = await supabase
-        .from('businesses')
-        .select('address, city')
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (business?.address) {
-        return `📍 *Hamara Address:*\n${business.address}${business.city ? ', ' + business.city : ''}`;
-      }
-    }
-
-    const timingQuery = /time|timing|open|close|hours|baje|kab/.test(text);
-    if (timingQuery) {
-      const { data: business } = await supabase
-        .from('businesses')
-        .select('business_hours')
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (business?.business_hours) {
-        return `⏰ *Business Hours:*\n${business.business_hours}`;
-      }
-    }
-
-    // Step 5: Fallback
-    log('info', 'No match — sending fallback', { from, text: text.slice(0, 30) });
-    return "Shukriya aapke message ke liye! 🙏\n\nHum jald reply karenge.\n\nYa in options mein se choose karein:\n• *price* — Products ki price list\n• *stock* — Stock availability\n• *order* — Order karna";
-
-  } catch (err) {
-    log('error', 'getReply error', { error: err.message });
-    return "Shukriya! Hum jald reply karenge.";
-  }
-}
-
-// ── Send WhatsApp message ──
-async function sendMessage(to, message, phoneNumberId) {
-  const pid = phoneNumberId || SYSTEM_PHONE_NUMBER_ID;
-
-  if (!WA_TOKEN) {
-    log('error', 'WA_TOKEN missing in environment variables');
-    return;
-  }
-  if (!pid) {
-    log('error', 'No phone_number_id available');
-    return;
   }
 
-  try {
-    const response = await axios.post(
-      `${GRAPH_API_BASE}/${pid}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to,
-        type: 'text',
-        text: {
-          preview_url: false,
-          body: message
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${WA_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 10000
-      }
-    );
+  // Broadcast record save karo
+  await supabase.from('broadcasts').insert({
+    user_id,
+    message,
+    total_sent: results.sent,
+    total_failed: results.failed,
+    created_at: new Date().toISOString(),
+  });
 
-    log('info', 'Message sent successfully', {
-      to,
-      messageId: response.data?.messages?.[0]?.id
-    });
+  log('BROADCAST', `Done — Sent: ${results.sent} | Failed: ${results.failed}`);
+  res.json({ success: true, ...results });
+});
 
-  } catch (err) {
-    const meta = err.response?.data?.error;
-    log('error', 'WhatsApp send error', { to, code: meta?.code, message: meta?.message || err.message });
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 
-    if (meta?.code === 190)    log('error', 'FIX: WA_TOKEN expired — get new token from Meta Developer Console');
-    if (meta?.code === 100)    log('error', 'FIX: PHONE_NUMBER_ID is wrong or not connected to WhatsApp Business');
-    if (meta?.code === 131030) log('error', 'FIX: Customer did not message in last 24 hours — use template message');
-  }
-}
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'ConviDeskAI Backend'
+  });
+});
 
-// ── Log incoming message ──
-async function logIncomingMessage(phone, text, phoneNumberId) {
-  if (!phoneNumberId) return;
+// ─── START ────────────────────────────────────────────────────────────────────
 
-  const userId = await getUserId(phoneNumberId);
-  if (!userId) return;
-
-  await supabase
-    .from('contacts')
-    .upsert({
-      user_id: userId,
-      phone,
-      name: phone,
-      last_message: text.slice(0, 100),
-      last_seen: new Date().toISOString(),
-    }, {
-      onConflict: 'user_id,phone',
-      ignoreDuplicates: false
-    });
-}
-
-// ── Start server ──
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log('info', `ConviDesk backend running on port ${PORT}`);
+  log('SERVER', `ConviDeskAI backend running on port ${PORT}`);
 });

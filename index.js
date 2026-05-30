@@ -157,9 +157,11 @@ async function getReply(userId, text) {
   log('REPLY', `Processing: "${text}" | userId: ${userId}`);
 
   // ── 1. Knowledge Base ─────────────────────────────────────────────────────
+  // FIX: user_id filter wapas — sirf sahi user ki KB entries match hongi
   const { data: kbItems, error: kbErr } = await supabase
     .from('knowledge_base')
     .select('title, content, keywords, is_active')
+    .eq('user_id', userId)
 
   if (kbErr) log('KB_ERR', kbErr.message);
   log('KB', `Fetched ${kbItems?.length || 0} total KB entries`);

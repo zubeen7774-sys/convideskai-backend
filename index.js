@@ -164,9 +164,14 @@ async function captureLead(userId, customerPhone, customerName, inquiryType, sco
 
 function needsHumanTakeover(text) {
   const t = text.toLowerCase();
-  const triggers = ['complaint', 'refund', 'return', 'damaged', 'wrong item',
-    'speak to human', 'agent', 'manager', 'help me', 'urgent',
-    'problem', 'issue', 'not working', 'fraud', 'cheated'];
+  // Sirf yeh exact phrases pe human takeover — single words nahi
+  // refund/return/policy KB se handle hoga pehle
+  const triggers = [
+    'speak to human', 'speak to agent', 'human agent',
+    'manager se baat', 'manager chahiye', 'agent chahiye',
+    'complaint karna hai', 'fraud hua', 'cheated',
+    'wrong item mila', 'damaged item',
+  ];
   return triggers.some(k => t.includes(k));
 }
 
@@ -180,7 +185,6 @@ async function getReply(userId, customerPhone, text) {
     .from('knowledge_base')
     .select('title, content, keywords')
     .eq('user_id', userId)
-    .eq('is_active', true);
 
   if (kbItems && kbItems.length > 0) {
     for (const kb of kbItems) {
@@ -202,7 +206,6 @@ async function getReply(userId, customerPhone, text) {
     .from('auto_reply_rules')
     .select('keyword, reply')
     .eq('user_id', userId)
-    .eq('is_active', true);
 
   if (rules && rules.length > 0) {
     for (const rule of rules) {

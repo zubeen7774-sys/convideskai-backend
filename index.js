@@ -1,6 +1,5 @@
-Yeh lo improved backend code:
+require('dotenv').config();
 
-```javascript
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
@@ -20,7 +19,7 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// ── In-memory dedup cache (resets on restart, use Redis for production) ──
+// ── In-memory dedup cache ──
 const processedMessages = new Set();
 
 // ── Logging helper ──
@@ -33,8 +32,8 @@ function log(level, msg, data = {}) {
 
 // ── Health check ──
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     service: 'ConviDesk WhatsApp Bot',
     version: '2.0.0',
     timestamp: new Date().toISOString()
@@ -58,7 +57,6 @@ app.get('/webhook', (req, res) => {
 
 // ── Webhook message handler ──
 app.post('/webhook', async (req, res) => {
-  // Always respond 200 immediately to Meta
   res.sendStatus(200);
 
   try {
@@ -71,7 +69,6 @@ app.post('/webhook', async (req, res) => {
     const message = entry.messages?.[0];
     if (!message) return;
 
-    // Only handle text messages
     if (message.type !== 'text') return;
 
     const messageId = message.id;
@@ -79,23 +76,17 @@ app.post('/webhook', async (req, res) => {
     const text = message.text.body.trim();
     const phoneNumberId = entry.metadata?.phone_number_id;
 
-    // Dedup check
     if (processedMessages.has(messageId)) {
       log('info', 'Duplicate message skipped', { messageId });
       return;
     }
     processedMessages.add(messageId);
-
-    // Clean up cache after 10 min
     setTimeout(() => processedMessages.delete(messageId), 10 * 60 * 1000);
 
     log('info', 'Message received', { from, phoneNumberId, text: text.slice(0, 50) });
 
-    // Get reply and send
     const reply = await getReply(from, text.toLowerCase(), phoneNumberId);
     await sendMessage(from, reply, phoneNumberId);
-
-    // Save to contacts log
     await logIncomingMessage(from, text, phoneNumberId).catch(() => {});
 
   } catch (err) {
@@ -115,7 +106,6 @@ async function getUserId(phoneNumberId) {
     if (data?.user_id) return data.user_id;
   }
 
-  // Fallback to first business
   const { data } = await supabase
     .from('businesses')
     .select('user_id')
@@ -135,26 +125,30 @@ async function getReply(from, text, phoneNumberId) {
       return "Shukriya! Hum jald reply karenge.";
     }
 
-    // ── Step 1: Knowledge Base ──
+    // Step 1: Knowledge Base
     const { data: knowledge } = await supabase
       .from('knowledge_base')
-      .select('title, content')
-      .eq('user_id', userId);
+      .select('title, content, keywords')
+      .eq('user_id', userId)
+      .eq('is_active', true);
 
     if (knowledge?.length > 0) {
       for (const item of knowledge) {
-        if (item.title && text.includes(item.title.toLowerCase())) {
+        const titleMatch = item.title && text.includes(item.title.toLowerCase());
+        const keywordMatch = item.keywords && item.keywords.split(',').some(k => text.includes(k.trim().toLowerCase()));
+        if (titleMatch || keywordMatch) {
           log('info', 'Knowledge base match', { title: item.title });
           return item.content;
         }
       }
     }
 
-    // ── Step 2: Auto Reply Rules ──
+    // Step 2: Auto Reply Rules
     const { data: rules } = await supabase
       .from('auto_reply_rules')
       .select('keyword, reply')
-      .eq('user_id', userId);
+      .eq('user_id', userId)
+      .eq('is_active', true);
 
     if (rules?.length > 0) {
       for (const rule of rules) {
@@ -166,7 +160,7 @@ async function getReply(from, text, phoneNumberId) {
       }
     }
 
-    // ── Step 3: Product Queries ──
+    // Step 3: Product Queries
     const isPriceQuery = /price|rate|kitna|cost|kya hai|btao|product|list|catalogue|catalog/.test(text);
     const isStockQuery = /stock|available|hai kya|milega|inventory/.test(text);
 
@@ -178,7 +172,6 @@ async function getReply(from, text, phoneNumberId) {
 
       if (products?.length > 0) {
         if (isPriceQuery) {
-          // Check if asking about specific product
           const specificProduct = products.find(p =>
             text.includes(p.name.toLowerCase())
           );
@@ -187,7 +180,6 @@ async function getReply(from, text, phoneNumberId) {
             return `*${specificProduct.name}*\n💰 Price: ₹${specificProduct.price}\n📦 Stock: ${specificProduct.stock > 0 ? specificProduct.stock + ' units available' : 'Out of stock'}`;
           }
 
-          // Group by category if available
           const byCategory = products.reduce((acc, p) => {
             const cat = p.category || 'Products';
             if (!acc[cat]) acc[cat] = [];
@@ -222,7 +214,7 @@ async function getReply(from, text, phoneNumberId) {
       }
     }
 
-    // ── Step 4: Common queries ──
+    // Step 4: Common queries
     const greetings = /^(hi|hello|hey|helo|hii|namaste|namaskar|salaam|salam|assalam)/.test(text);
     if (greetings) {
       return "Namaste! 👋 Hamare store mein aapka swagat hai!\n\nMain aapki kya madad kar sakta hoon?\n• Price list ke liye likhein: *price*\n• Stock check ke liye: *stock*\n• Order ke liye: *order*";
@@ -259,7 +251,7 @@ async function getReply(from, text, phoneNumberId) {
       }
     }
 
-    // ── Step 5: Fallback ──
+    // Step 5: Fallback
     log('info', 'No match — sending fallback', { from, text: text.slice(0, 30) });
     return "Shukriya aapke message ke liye! 🙏\n\nHum jald reply karenge.\n\nYa in options mein se choose karein:\n• *price* — Products ki price list\n• *stock* — Stock availability\n• *order* — Order karna";
 
@@ -273,6 +265,10 @@ async function getReply(from, text, phoneNumberId) {
 async function sendMessage(to, message, phoneNumberId) {
   const pid = phoneNumberId || SYSTEM_PHONE_NUMBER_ID;
 
+  if (!WA_TOKEN) {
+    log('error', 'WA_TOKEN missing in environment variables');
+    return;
+  }
   if (!pid) {
     log('error', 'No phone_number_id available');
     return;
@@ -286,9 +282,9 @@ async function sendMessage(to, message, phoneNumberId) {
         recipient_type: 'individual',
         to,
         type: 'text',
-        text: { 
+        text: {
           preview_url: false,
-          body: message 
+          body: message
         }
       },
       {
@@ -300,31 +296,34 @@ async function sendMessage(to, message, phoneNumberId) {
       }
     );
 
-    log('info', 'Message sent successfully', { 
-      to, 
-      messageId: response.data?.messages?.[0]?.id 
+    log('info', 'Message sent successfully', {
+      to,
+      messageId: response.data?.messages?.[0]?.id
     });
 
   } catch (err) {
-    const errorData = err.response?.data || err.message;
-    log('error', 'WhatsApp send error', { to, error: errorData });
+    const meta = err.response?.data?.error;
+    log('error', 'WhatsApp send error', { to, code: meta?.code, message: meta?.message || err.message });
+
+    if (meta?.code === 190)    log('error', 'FIX: WA_TOKEN expired — get new token from Meta Developer Console');
+    if (meta?.code === 100)    log('error', 'FIX: PHONE_NUMBER_ID is wrong or not connected to WhatsApp Business');
+    if (meta?.code === 131030) log('error', 'FIX: Customer did not message in last 24 hours — use template message');
   }
 }
 
-// ── Log incoming message to contacts ──
+// ── Log incoming message ──
 async function logIncomingMessage(phone, text, phoneNumberId) {
   if (!phoneNumberId) return;
 
   const userId = await getUserId(phoneNumberId);
   if (!userId) return;
 
-  // Upsert contact
   await supabase
     .from('contacts')
     .upsert({
       user_id: userId,
       phone,
-      name: phone, // Will be updated when we get profile info
+      name: phone,
       last_message: text.slice(0, 100),
       last_seen: new Date().toISOString(),
     }, {
@@ -336,31 +335,5 @@ async function logIncomingMessage(phone, text, phoneNumberId) {
 // ── Start server ──
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log('info', `Server running on port ${PORT}`);
+  log('info', `ConviDesk backend running on port ${PORT}`);
 });
-```
-
----
-
-## Kya Improve Hua
-
-| Feature | Pehle | Ab |
-|---------|-------|-----|
-| Response timing | res baad mein | res.sendStatus(200) pehle |
-| Multi-client | Sirf pehla business | phone_number_id se correct client |
-| Dedup | Nahi tha | In-memory cache |
-| Knowledge Base | Nahi tha | Step 1 mein check |
-| Reply order | Rules → Products | KB → Rules → Products → Common → Fallback |
-| Greetings | Nahi | Auto-detect |
-| Order query | Nahi | Auto-detect |
-| Location/Timing | Nahi | DB se fetch |
-| Category grouping | Nahi | Products category wise |
-| Specific product | Nahi | Name match karta hai |
-| Logging | console.log | Structured JSON logs |
-| API version | v18.0 | v21.0 |
-| Error handling | Basic | Proper try-catch everywhere |
-| Health check | Nahi | `/` endpoint |
-
----
-
-**GitHub pe `index.js` replace karo → Railway auto-deploy karega.**
